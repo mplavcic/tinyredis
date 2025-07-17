@@ -11,11 +11,21 @@ use tokio::sync::Mutex;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+
+#[derive(Clone)]
+struct ValueEntry {
+    value: String,
+    expires_at: Option<Instant>,
+}
+
+type Db = Arc<Mutex<HashMap<String, ValueEntry>>>;
 
 #[tokio::main]
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
-    let db: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let db: Db = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         let stream = listener.accept().await;
@@ -69,7 +79,7 @@ async fn main() {
     }
 }
 
-async fn handle_command(value: RespValue, stream: &mut tokio::net::TcpStream, db: &Arc<Mutex<HashMap<String, String>>>) {
+async fn handle_command(value: RespValue, stream: &mut tokio::net::TcpStream, db: &Db) {
     match value {
         RespValue::Array(elements) => {
             if let Some(RespValue::BulkString(Some(cmd))) = elements.get(0) {
@@ -94,41 +104,94 @@ async fn handle_command(value: RespValue, stream: &mut tokio::net::TcpStream, db
                         }
                     }
                     "SET" => {
-                        if elements.len() != 3 {
-                            let _ = stream.write_all(b"-ERR wrong number of arguments for 'set'\r\n").await;
+                        if elements.len() < 3 {
+                            let _ = stream
+                                .write_all(b"-ERR wrong number of arguments for 'set'\r\n")
+                                .await;
                             return;
                         }
 
-                        if let (Some(RespValue::BulkString(Some(key))), Some(RespValue::BulkString(Some(val)))) =
-                            (elements.get(1), elements.get(2))
-                        {
-                            let mut db = db.lock().await;
-                            db.insert(key.clone(), val.clone());
-                            let _ = stream.write_all(b"+OK\r\n").await;
-                        } else {
-                            let _ = stream.write_all(b"-ERR invalid arguments for 'set'\r\n").await;
-                        }
-                    }
+                        let key = match elements.get(1) {
+                            Some(RespValue::BulkString(Some(k))) => k.clone(),
+                            _ => {
+                                let _ = stream.write_all(b"-ERR invalid key\r\n").await;
+                                return;
+                            }
+                        };
 
+                        let val = match elements.get(2) {
+                            Some(RespValue::BulkString(Some(v))) => v.clone(),
+                            _ => {
+                                let _ = stream.write_all(b"-ERR invalid value\r\n").await;
+                                return;
+                            }
+                        };
+
+                        let mut expires_at = None;
+                        if elements.len() >= 5 {
+                            if let (
+                                Some(RespValue::BulkString(Some(opt))),
+                                Some(RespValue::BulkString(Some(seconds_str))),
+                            ) = (elements.get(3), elements.get(4))
+                            {
+                                if opt.to_uppercase() == "PX" {
+                                    if let Ok(miliseconds) = seconds_str.parse::<u64>() {
+                                        expires_at = Some(
+                                            Instant::now() + Duration::from_millis(miliseconds),
+                                        );
+                                    } else {
+                                        let _ =
+                                            stream.write_all(b"-ERR invalid expire time\r\n").await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut db = db.lock().await;
+                        db.insert(
+                            key,
+                            ValueEntry {
+                                value: val,
+                                expires_at,
+                            },
+                        );
+
+                        let _ = stream.write_all(b"+OK\r\n").await;
+                    }
                     "GET" => {
                         if elements.len() != 2 {
-                            let _ = stream.write_all(b"-ERR wrong number of arguments for 'get'\r\n").await;
+                            let _ = stream
+                                .write_all(b"-ERR wrong number of arguments for 'get'\r\n")
+                                .await;
                             return;
                         }
 
-                        if let Some(RespValue::BulkString(Some(key))) = elements.get(1) {
-                            let db = db.lock().await;
-                            if let Some(val) = db.get(key) {
-                                let response = format!("${}\r\n{}\r\n", val.len(), val);
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            } else {
-                                let _ = stream.write_all(b"$-1\r\n").await; // RESP nil
+                        let key = match elements.get(1) {
+                            Some(RespValue::BulkString(Some(k))) => k,
+                            _ => {
+                                let _ = stream.write_all(b"-ERR invalid key\r\n").await;
+                                return;
                             }
+                        };
+
+                        let mut db = db.lock().await;
+
+                        if let Some(entry) = db.get(key) {
+                            if let Some(expiry) = entry.expires_at {
+                                if Instant::now() > expiry {
+                                    db.remove(key);
+                                    let _ = stream.write_all(b"$-1\r\n").await;
+                                    return;
+                                }
+                            }
+
+                            let response = format!("${}\r\n{}\r\n", entry.value.len(), entry.value);
+                            let _ = stream.write_all(response.as_bytes()).await;
                         } else {
-                            let _ = stream.write_all(b"-ERR invalid argument for 'get'\r\n").await;
+                            let _ = stream.write_all(b"$-1\r\n").await;
                         }
                     }
-
                     _ => {
                         let _ = stream.write_all(b"-ERR unknown command\r\n").await;
                     }
